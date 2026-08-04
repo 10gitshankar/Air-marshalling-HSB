@@ -1,0 +1,25 @@
+# Unity
+Library/
+Temp/
+Obj/
+Build/
+Logs/
+*.csproj
+*.sln
+*.userprefs
+.vs/
+
+# KiCad
+*-bak
+*.kicad_prl
+fp-info-cache
+_autosave-*
+*.bak
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Python
+__pycache__/
+*.pyc
