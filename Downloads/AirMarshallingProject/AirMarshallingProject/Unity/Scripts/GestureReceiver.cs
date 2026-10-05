@@ -1,56 +1,78 @@
 /*
   Air Marshalling Project — GestureReceiver.cs
-
-  Attach this to an empty GameObject in your scene (name it "GestureManager").
-
-  Listens for UDP packets from BOTH ESP32 boards on the same port and
-  combines their LEFT/RIGHT state into one gesture that PlaneController.cs
-  (and the debug UI) can read.
-
-  Expected packet format from ESP32: "HAND,STATE,gyroMagnitude"
-  Example: "LEFT,MOVING,84.2"   or   "RIGHT,STILL,12.1"   or   "LEFT,HOLD,0.0"
-
-  STATE can be:
-    MOVING - gyro magnitude above threshold
-    STILL  - gyro magnitude below threshold
-    HOLD   - limit switch on that hand is NOT pressed. The MPU is still being
-             read on the ESP32, but the board is deliberately withholding real
-             motion data. Unity must treat HOLD as "freeze the plane" so idle
-             sensor jitter never leaks into the simulation while the operator
-             isn't actively holding the switch down.
-
-  This version is hardened against common Unity/UDP problems:
-   - Handles "port already in use" cleanly (stop Play, it releases the port)
-   - Tracks last-received time per hand so you can tell if a board has
-     gone silent (WiFi dropped, board powered off, etc.)
-   - Thread-safe reads via lock()
+  Attach this to an empty GameObject in your scene named "GestureManager".
+  Receives UDP packets from both ESP32 wands on port 4210.
 */
 
 using UnityEngine;
 using System;
+using System.Globalization;
 using System.Net;
 using System.Net.Sockets;
 using System.Threading;
 
 public class GestureReceiver : MonoBehaviour
 {
+    public enum Elevation { DOWN, MID, UP }
+    public enum Motion { STILL, MOVING, FAST }
+
+    [Header("Network Configuration")]
     [Tooltip("Must match unityPort in both ESP32 .ino files")]
     public int port = 4210;
-
-    [Tooltip("If no packet received from a hand for this many seconds, treat it as disconnected")]
     public float staleTimeoutSeconds = 2f;
+
+    [Header("Elevation Thresholds (Pitch in degrees)")]
+    public float upPitch = 45f;
+    public float downPitch = -30f;
+    public float identifyPitch = 70f;
+
+    [Header("Sensor Invert / Offsets")]
+    public bool invertLeftPitch = false;
+    public bool invertRightPitch = false;
+
+    [Header("Motion Thresholds")]
+    public float fastGyroThreshold = 180f;
+
+    [Header("Debounce / Filter")]
+    public float gestureHoldTime = 0.25f;
+
+    [Header("Live Data - Left Hand")]
+    public string leftRawState = "HOLD";
+    public float leftPitch;
+    public float leftRoll;
+    public float leftYaw;
+    public float leftGyro;
+    public Elevation leftElevation = Elevation.MID;
+    public Motion leftMotion = Motion.STILL;
+
+    [Header("Live Data - Right Hand")]
+    public string rightRawState = "HOLD";
+    public float rightPitch;
+    public float rightRoll;
+    public float rightYaw;
+    public float rightGyro;
+    public Elevation rightElevation = Elevation.MID;
+    public Motion rightMotion = Motion.STILL;
+
+    [Header("Final Detected Gesture")]
+    public string stableGesture = "STOP";
 
     private UdpClient udpClient;
     private Thread receiveThread;
     private readonly object lockObj = new object();
 
-    private string leftState = "STILL";
-    private string rightState = "STILL";
     private double leftLastSeen = -999;
     private double rightLastSeen = -999;
 
+    private float rawL_p, rawL_r, rawL_y, rawL_g;
+    private string rawL_s = "HOLD";
+    private float rawR_p, rawR_r, rawR_y, rawR_g;
+    private string rawR_s = "HOLD";
+
+    private string candidate = "STOP";
+    private float candidateTimer = 0f;
     private volatile bool running = true;
-    private readonly System.Diagnostics.Stopwatch clock = System.Diagnostics.Stopwatch.StartNew();   // thread-safe timer, unlike UnityEngine.Time
+    private readonly System.Diagnostics.Stopwatch clock = System.Diagnostics.Stopwatch.StartNew();
 
     void Start()
     {
@@ -70,8 +92,7 @@ public class GestureReceiver : MonoBehaviour
         }
         catch (Exception e)
         {
-            Debug.LogError("Could not bind UDP port " + port + ": " + e.Message +
-                            "  (Is another instance already running? Stop Play and try again.)");
+            Debug.LogError("UDP bind error port " + port + ": " + e.Message);
             return;
         }
 
@@ -82,7 +103,7 @@ public class GestureReceiver : MonoBehaviour
             try
             {
                 IPEndPoint anyIP = new IPEndPoint(IPAddress.Any, 0);
-                byte[] data = udpClient.Receive(ref anyIP);   // blocks until a packet arrives
+                byte[] data = udpClient.Receive(ref anyIP);
                 string text = System.Text.Encoding.ASCII.GetString(data);
                 string[] parts = text.Split(',');
 
@@ -91,87 +112,167 @@ public class GestureReceiver : MonoBehaviour
                     string hand = parts[0].Trim();
                     string state = parts[1].Trim();
 
+                    float g = 0f, p = 0f, r = 0f, y = 0f;
+                    if (parts.Length >= 3) float.TryParse(parts[2].Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out g);
+                    if (parts.Length >= 4) float.TryParse(parts[3].Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out p);
+                    if (parts.Length >= 5) float.TryParse(parts[4].Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out r);
+                    if (parts.Length >= 6) float.TryParse(parts[5].Trim(), NumberStyles.Float, CultureInfo.InvariantCulture, out y);
+
                     lock (lockObj)
                     {
                         if (hand == "LEFT")
                         {
-                            leftState = state;
+                            rawL_s = state;
+                            rawL_g = g;
+                            rawL_p = p;
+                            rawL_r = r;
+                            rawL_y = y;
                             leftLastSeen = clock.Elapsed.TotalSeconds;
                         }
                         else if (hand == "RIGHT")
                         {
-                            rightState = state;
+                            rawR_s = state;
+                            rawR_g = g;
+                            rawR_p = p;
+                            rawR_r = r;
+                            rawR_y = y;
                             rightLastSeen = clock.Elapsed.TotalSeconds;
                         }
                     }
                 }
             }
-            catch (SocketException)
-            {
-                // thrown when the socket is closed on stop — expected, ignore
-                break;
-            }
-            catch (Exception e)
-            {
-                Debug.LogError("UDP receive error: " + e);
-            }
+            catch (SocketException) { break; }
+            catch (Exception) { }
         }
     }
 
-    // Called every frame by PlaneController to decide what the plane should do
+    void Update()
+    {
+        double now = clock.Elapsed.TotalSeconds;
+        bool leftAlive = (now - leftLastSeen) < staleTimeoutSeconds;
+        bool rightAlive = (now - rightLastSeen) < staleTimeoutSeconds;
+
+        lock (lockObj)
+        {
+            leftRawState = leftAlive ? rawL_s : "OFFLINE";
+            rightRawState = rightAlive ? rawR_s : "OFFLINE";
+
+            leftGyro = rawL_g;
+            leftPitch = invertLeftPitch ? -rawL_p : rawL_p;
+            leftRoll = rawL_r;
+            leftYaw = rawL_y;
+
+            rightGyro = rawR_g;
+            rightPitch = invertRightPitch ? -rawR_p : rawR_p;
+            rightRoll = rawR_r;
+            rightYaw = rawR_y;
+        }
+
+        leftElevation = ToElevation(leftPitch);
+        rightElevation = ToElevation(rightPitch);
+        leftMotion = ToMotion(leftRawState, leftGyro);
+        rightMotion = ToMotion(rightRawState, rightGyro);
+
+        // Safety Gate: Either button released or disconnected -> Freeze plane
+        if (leftRawState == "HOLD" || rightRawState == "HOLD" || !leftAlive || !rightAlive)
+        {
+            stableGesture = "STOP";
+            candidate = "STOP";
+            candidateTimer = 0f;
+            return;
+        }
+
+        string rawGesture = Classify();
+
+        // Debounce Filter
+        if (rawGesture == candidate)
+        {
+            candidateTimer += Time.deltaTime;
+            if (candidateTimer >= gestureHoldTime)
+            {
+                stableGesture = candidate;
+            }
+        }
+        else
+        {
+            candidate = rawGesture;
+            candidateTimer = 0f;
+        }
+    }
+
+    Elevation ToElevation(float pitchVal)
+    {
+        if (pitchVal > upPitch) return Elevation.UP;
+        if (pitchVal < downPitch) return Elevation.DOWN;
+        return Elevation.MID;
+    }
+
+    Motion ToMotion(string state, float gyro)
+    {
+        if (state != "MOVING") return Motion.STILL;
+        if (gyro > fastGyroThreshold) return Motion.FAST;
+        return Motion.MOVING;
+    }
+
+    string Classify()
+    {
+        bool lM = leftMotion != Motion.STILL;
+        bool rM = rightMotion != Motion.STILL;
+        bool lS = !lM;
+        bool rS = !rM;
+
+        Elevation L = leftElevation;
+        Elevation R = rightElevation;
+
+        // 1. Both Hands UP (Overhead)
+        if (L == Elevation.UP && R == Elevation.UP)
+        {
+            if (leftMotion == Motion.FAST || rightMotion == Motion.FAST) return "EMERGENCY_STOP";
+            if (lM && rM) return "CHOCKS";
+            if (lS && rS)
+            {
+                if (leftPitch > identifyPitch && rightPitch > identifyPitch) return "IDENTIFY_GATE";
+                return "NORMAL_STOP";
+            }
+        }
+
+        // 2. Engine Start (Left UP still, Right UP moving)
+        if (L == Elevation.UP && lS && R == Elevation.UP && rM) return "START_ENGINE";
+
+        // 3. All Clear Salute (Left DOWN still, Right UP still)
+        if (L == Elevation.DOWN && lS && R == Elevation.UP && rS) return "ALL_CLEAR";
+
+        // 4. Both Hands DOWN (Low level)
+        if (L == Elevation.DOWN && R == Elevation.DOWN)
+        {
+            if (lM && rM) return "SLOW_DOWN";
+            if (lS && rS) return "HOLD_POSITION";
+        }
+
+        // 5. Cut Engines (Left DOWN still, Right moving)
+        if (L == Elevation.DOWN && lS && rM) return "CUT_ENGINES";
+
+        // 6. Chest Level (MID)
+        if (lM && rM) return "MOVE_AHEAD";
+        if (lM && rS) return "TURN_LEFT";
+        if (lS && rM) return rightMotion == Motion.FAST ? "ENGINE_FIRE" : "TURN_RIGHT";
+
+        return "STOP";
+    }
+
     public string GetGesture()
     {
-        lock (lockObj)
-        {
-            bool leftAlive = (clock.Elapsed.TotalSeconds - leftLastSeen) < staleTimeoutSeconds;
-            bool rightAlive = (clock.Elapsed.TotalSeconds - rightLastSeen) < staleTimeoutSeconds;
-
-            // A hand that has gone stale (board offline/WiFi dropped) is treated as STILL,
-            // same as before — this is unrelated to the HOLD gate below.
-            string l = leftAlive ? leftState : "STILL";
-            string r = rightAlive ? rightState : "STILL";
-
-            // HOLD gate: if either hand's limit switch is not pressed, force the plane
-            // to freeze regardless of what the other hand is doing. This is deliberately
-            // checked first, before the MOVING/STILL combination logic, so a HOLD on
-            // either board always wins.
-            if (l == "HOLD" || r == "HOLD")
-            {
-                return "STOP";
-            }
-
-            if (l == "STILL" && r == "STILL") return "STOP";
-            if (l == "MOVING" && r == "STILL") return "TURN_LEFT";
-            if (l == "STILL" && r == "MOVING") return "TURN_RIGHT";
-            if (l == "MOVING" && r == "MOVING") return "MOVE_AHEAD";
-            return "STOP";
-        }
+        return stableGesture;
     }
 
-    // Useful for an on-screen debug label — shows connection status too
     public string GetDebugStatus()
     {
-        lock (lockObj)
-        {
-            bool leftAlive = (clock.Elapsed.TotalSeconds - leftLastSeen) < staleTimeoutSeconds;
-            bool rightAlive = (clock.Elapsed.TotalSeconds - rightLastSeen) < staleTimeoutSeconds;
-
-            string l = leftAlive ? leftState : "OFFLINE";
-            string r = rightAlive ? rightState : "OFFLINE";
-
-            return "LEFT: " + l + "   RIGHT: " + r + "   Gesture: " + GetGesture();
-        }
+        return string.Format("L:[{0} P:{1:F0}° G:{2:F0}]  R:[{3} P:{4:F0}° G:{5:F0}]  GESTURE:{6}",
+            leftRawState, leftPitch, leftGyro, rightRawState, rightPitch, rightGyro, stableGesture);
     }
 
-    void OnApplicationQuit()
-    {
-        Shutdown();
-    }
-
-    void OnDestroy()
-    {
-        Shutdown();
-    }
+    void OnApplicationQuit() { Shutdown(); }
+    void OnDestroy() { Shutdown(); }
 
     void Shutdown()
     {
